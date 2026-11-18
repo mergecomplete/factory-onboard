@@ -61,7 +61,7 @@ function Items() {
 
   return (
     <section>
-      <h1>Items</h1>
+      <h1>Reports</h1>
       {items === null ? (
         <p>Loading…</p>
       ) : items.length === 0 ? (
