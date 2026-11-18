@@ -1,0 +1,7 @@
+# This file makes the sample app its own pnpm workspace root. Without it,
+# pnpm inside the factory repo walks up, finds the factory's
+# pnpm-workspace.yaml, and installs against the factory's lockfile. With it,
+# `pnpm install --frozen-lockfile` here reads only this folder's
+# pnpm-lock.yaml, as it will once the app is pushed to a repo of its own.
+packages:
+  - "."

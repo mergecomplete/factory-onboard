@@ -1,0 +1,51 @@
+// The sample app's Worker: the API (/api/*, /version) and the built page as
+// static assets, at one address. The factory's end-to-end checks push this
+// app to a scratch repo (scripts/push-fixture.sh in the factory repo) and
+// watch its CI and deploys.
+//
+//   pnpm dev                                   wrangler dev and Vite, ports from PORT and API_PORT
+//   wrangler deploy --env staging --var VERSION:<sha>     what .github/workflows/deploy.yml runs
+//
+// The top level is local development only. Deploys always name an env; vars
+// aren't inherited by envs, so each one sets ENVIRONMENT again.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "factory-onboard-dev",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    // Vite's build. pnpm dev makes an empty one so wrangler starts before the
+    // first build; in development Vite serves the page instead.
+    "directory": "dist",
+    "run_worker_first": ["/api/*", "/version"],
+    // index.html for any other path that isn't a file.
+    "not_found_handling": "single-page-application"
+  },
+
+  "vars": { "ENVIRONMENT": "development" },
+  "observability": { "enabled": true },
+
+  // Each env deploys to workers.dev rather than a custom route, so a fresh
+  // Cloudflare account can run it with no zone. The address is
+  // https://<name>.<account subdomain>.workers.dev, and the workflows read it
+  // from the repo variables STAGING_URL and PRODUCTION_URL, so moving to a
+  // custom domain later is a change here and to those two variables, not to
+  // the workflows. To move: set "workers_dev": false and add
+  // "routes": [{ "pattern": "<host>", "custom_domain": true }].
+  "env": {
+    "staging": {
+      "name": "factory-onboard-staging",
+      "workers_dev": true,
+      "preview_urls": false,
+      "vars": { "ENVIRONMENT": "staging" }
+    },
+    "production": {
+      "name": "factory-onboard",
+      "workers_dev": true,
+      "preview_urls": false,
+      "vars": { "ENVIRONMENT": "production" }
+    }
+  }
+}
