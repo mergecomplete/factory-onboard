@@ -21,6 +21,12 @@ export type Env = {
 export function createApp(store: MemoryStore) {
   const app = new Hono<Env>();
 
+  // The deployed commit. CI's deploy polls this until it shows the commit it
+  // just deployed, and the factory's staging check reads the same field.
+  app.get("/version", (c) =>
+    c.json({ version: c.env?.VERSION || "dev", environment: c.env?.ENVIRONMENT ?? "development" }),
+  );
+
   app.get("/api/items", (c) => c.json({ items: store.list() }));
 
   app.post("/api/items", async (c) => {

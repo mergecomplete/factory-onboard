@@ -1,0 +1,201 @@
+# Staging on every merge to master, once CI passes; production by hand.
+#
+#   gh workflow run deploy.yml                     production, at the commit staging serves
+#   gh workflow run deploy.yml -f sha=<full sha>   production, at that commit
+#
+# Each job deploys with --var VERSION:<sha> and then polls the app's /version
+# until it serves that commit, so a green job means the commit is live, not
+# only uploaded. The factory watches the deploy-staging job by name, so keep
+# the job names as they are.
+#
+# Set up once, in the repo's settings:
+#   - environments `staging` and `production`, each with the secrets
+#     CLOUDFLARE_API_TOKEN (Account > Workers Scripts: Edit) and
+#     CLOUDFLARE_ACCOUNT_ID;
+#   - repo variables STAGING_URL and PRODUCTION_URL, each app's address with
+#     no trailing slash (https://factory-fixture-staging.<subdomain>.workers.dev
+#     while wrangler.jsonc deploys to workers.dev).
+
+name: Deploy
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "The full commit to deploy to production. Leave empty for the commit staging serves."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "24"
+
+jobs:
+  deploy-staging:
+    # Only a successful CI run on a push to master; a pull request's run, or a
+    # red one, deploys nothing.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    # Includes the wait for earlier deploys below.
+    timeout-minutes: 30
+    environment: staging
+    # Listing this workflow's earlier runs needs actions: read.
+    permissions:
+      contents: read
+      actions: read
+    # No concurrency group, on purpose. GitHub keeps only one pending run per
+    # group and cancels the older one when a newer one queues, so with three
+    # quick merges the middle one would end as cancelled, and the factory
+    # would find no deploy for its commit. Instead each run waits for the
+    # earlier ones to finish, and a run whose commit staging already contains
+    # passes without deploying.
+    env:
+      # The commit CI passed, not whatever master is now.
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      APP_URL: ${{ vars.STAGING_URL }}
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: STAGING_URL is set
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "::error::Set the repo variable STAGING_URL to the staging app's address, then re-run this job."
+            exit 1
+          fi
+      # One staging deploy at a time, in the order the runs started, so an
+      # older commit can't land halfway through a newer one's deploy.
+      - name: Wait for earlier staging deploys
+        run: |
+          workflow=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .workflow_id)
+          while :; do
+            earlier=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?event=workflow_run&per_page=100" \
+              --jq "[.workflow_runs[] | select(.run_number < $GITHUB_RUN_NUMBER and .status != \"completed\")] | length")
+            [ "$earlier" -eq 0 ] && break
+            echo "Waiting for $earlier earlier staging deploy(s) to finish"
+            sleep 15
+          done
+      # The full history, so the next step can tell whether staging's commit
+      # contains this one.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+      # CI runs can finish out of merge order, so a newer merge may have
+      # deployed already. Deploying this commit then would roll staging back.
+      # Its changes are live inside the newer commit, so the job passes.
+      - name: Staging already has this commit?
+        id: newer
+        run: |
+          served=$(curl -fsS --max-time 10 "$APP_URL/version" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p') || served=""
+          if [ -n "$served" ] && [ "$served" != "$SHA" ] && git merge-base --is-ancestor "$SHA" "$served" 2>/dev/null; then
+            echo "::notice::Staging serves $served, which contains $SHA, so this run deploys nothing."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: ${{ steps.newer.outputs.skip != 'true' }}
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - if: ${{ steps.newer.outputs.skip != 'true' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - if: ${{ steps.newer.outputs.skip != 'true' }}
+        run: pnpm install --frozen-lockfile
+      - if: ${{ steps.newer.outputs.skip != 'true' }}
+        run: pnpm build
+      - if: ${{ steps.newer.outputs.skip != 'true' }}
+        run: pnpm exec wrangler deploy --env staging --var "VERSION:$SHA"
+      - name: Staging serves the commit
+        if: ${{ steps.newer.outputs.skip != 'true' }}
+        run: |
+          # Two minutes by the clock, every five seconds. Each curl gives up
+          # after ten, so a hanging answer can't stretch the wait.
+          deadline=$((SECONDS + 120))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            served=$(curl -fsS --max-time 10 "$APP_URL/version" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)
+            if [ "$served" = "$SHA" ]; then
+              echo "$APP_URL/version serves $SHA"
+              exit 0
+            fi
+            echo "Waiting: $APP_URL/version serves '${served:-nothing}', expecting $SHA"
+            sleep 5
+          done
+          echo "::error::$APP_URL/version didn't serve $SHA within two minutes."
+          exit 1
+
+  deploy-production:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Holds production's secrets, and a required reviewer if one is set.
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      INPUT_SHA: ${{ inputs.sha }}
+      STAGING_URL: ${{ vars.STAGING_URL }}
+      APP_URL: ${{ vars.PRODUCTION_URL }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Choose the commit
+        id: sha
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "::error::Set the repo variable PRODUCTION_URL to the production app's address, then run this again."
+            exit 1
+          fi
+          sha="$INPUT_SHA"
+          if [ -z "$sha" ]; then
+            if [ -z "$STAGING_URL" ]; then
+              echo "::error::No sha given and STAGING_URL isn't set, so there's no staging commit to promote. Pass -f sha=<full sha>."
+              exit 1
+            fi
+            sha=$(curl -fsS --max-time 10 "$STAGING_URL/version" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+            echo "Staging serves $sha"
+          fi
+          # A full sha, so the checkout and the poll below compare like with like.
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::'$sha' isn't a full 40-character commit sha. Pass one with -f sha=<full sha>."
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm exec wrangler deploy --env production --var "VERSION:$SHA"
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+      - name: Production serves the commit
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          deadline=$((SECONDS + 120))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            served=$(curl -fsS --max-time 10 "$APP_URL/version" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)
+            if [ "$served" = "$SHA" ]; then
+              echo "$APP_URL/version serves $SHA"
+              exit 0
+            fi
+            echo "Waiting: $APP_URL/version serves '${served:-nothing}', expecting $SHA"
+            sleep 5
+          done
+          echo "::error::$APP_URL/version didn't serve $SHA within two minutes."
+          exit 1

@@ -18,6 +18,19 @@ function post(body: unknown) {
   });
 }
 
+describe("/version", () => {
+  it("serves the deployed commit", async () => {
+    const response = await app.request("/version", {}, { VERSION: "abc1234", ENVIRONMENT: "staging" });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ version: "abc1234", environment: "staging" });
+  });
+
+  it("says dev when no commit was set", async () => {
+    const response = await app.request("/version", {}, {});
+    expect(await response.json()).toMatchObject({ version: "dev" });
+  });
+});
+
 describe("/api/items", () => {
   it("starts empty", async () => {
     const response = await app.request("/api/items");
